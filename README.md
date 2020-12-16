@@ -5,3 +5,6 @@ Precise activity recognition is a complexity task for the whole humakind. This b
 
 ## Requirements
 `Python >= 3.5.5, PyTorch == 1.7.1, torchvision == 0.8.2`
+
+## Ссылка на демо
+[ссылка на демо](https://github.com/Intelligent-Systems-Phystech/Filippova-BS-Thesis/blob/main/ProblemExample.ipynb)
