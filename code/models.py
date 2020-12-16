@@ -1,179 +1,276 @@
+import pickle
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from tqdm import tqdm
+
+import torch
 from torch import nn
+from torch.optim.lr_scheduler import StepLR
+
+from acclib.geometry import apply_quats
+from acclib.nets.utils import get_traj_from_v_t, process_data
+from acclib.nets.training import get_loaders, train
+from acclib.postprocess import fix_trajectories
+from acclib.show.prediction import show_trajectories
+from acclib.save_load_utils import create_folder
+from acclib.nets.models import LSTM, ResNet, ResNetLSTM
+
+HYPER_RL = [6, 64, 64, 128, 256, 2, 100, 0.5]
+HYPER_R = [6, 64, 64, 128, 256, 512, 0.5]
+HYPER_L = [6, 100, 3, 0.5]
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3,
-                               stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3,
-                               stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-        self.downsample = downsample
+class TrajectoryEstimator:
+    """
+    Provides easy and convenient interface for training and evaluating neural networks in
+    IMU navigation.
 
-    def forward(self, x):
-        residual = x
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        out = self.conv2(out)
-        out = self.bn2(out)
-        if self.downsample:
-            residual = self.downsample(x)
-        out += residual
-        out = self.relu(out)
-        return out
+    """
 
+    def __init__(self, name, model, window_size=200, step=50, trend=True, predict_correction=True,
+                 train_correction=False, frequency=200, device='cpu', path="../experiments",
+                 **kwargs):
+        """Interface for neural network usage in IMU navigation.
 
-class ResNet(nn.Module):
-    def __init__(self, channels):
-        super(ResNet, self).__init__()
-        self.init_params = channels
-        self.conv1 = nn.Conv1d(channels[0], channels[1], kernel_size=7,
-                               stride=2, padding=3, bias=True)
-        self.bn = nn.BatchNorm1d(channels[1])
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
+        Parameters
+        ----------
+        name : string
+            Name of the folder where all the results will be stored.
+        model : torch.nn.Module
+            A neural network that predicts velocities.
+        window_size : int
+            Window size for data preparation.
+        step : int
+            Step size for data preparation.
+        trend : bool
+            Whether to use gyroscope trend in world c.s. as an input channel.
+        frequency : int, optional (default=200)
+            Hz.
+        device : string
+            Device for a model.
+        path : str, optional (default="../experiments")
+            Path to the experiments' folder.
 
-        self.layer1 = nn.Sequential(
-            ResidualBlock(channels[1], channels[2]),
-            ResidualBlock(channels[2], channels[2]))
+        """
+        self.name = name
+        self.window_size = window_size
+        self.step = step
+        self.device = torch.device(device)
+        self.model = model
+        self.model = self.model.to(device)
+        self.predict_correction = predict_correction
+        self.train_correction = train_correction
+        self.trend = trend
+        self.frequency = frequency
+        self.train_params = None
+        self.path = path
 
-        self.downsample1 = nn.Sequential(
-            nn.Conv1d(channels[2], channels[3], kernel_size=1, stride=2, bias=False),
-            nn.BatchNorm1d(channels[3]))
+    def train_model(self, train_ind, valid_ind, storage, n_epochs=20, lr=1e-3, batch_size=128,
+                    verbose=True, save_loss=False):
+        """Trains a model of estimator.
 
-        self.layer2 = nn.Sequential(
-            ResidualBlock(channels[2], channels[3], stride=2, downsample=self.downsample1),
-            ResidualBlock(channels[3], channels[3]))
+        Parameters
+        ----------
+        train_ind : list of strings
+            Names of the experiments in train set.
+        valid_ind : list of strings
+            Names of the experiments in validation set.
+        storage : object of class Storage
+            Storage which contains the experiments.
+        n_epochs : int, optional (default=20)
+            Number of epochs.
+        lr : float, optional (default=0.001)
+            Learning rate.
+        batch_size : int, optional (default=128)
+            Batch size.
+        verbose : bool
+            Whether to print loss on different epochs.
+        save_loss : bool
+            Whether to save loss in figure and csv.
 
-        self.downsample2 = nn.Sequential(
-            nn.Conv1d(channels[3], channels[4], kernel_size=1, stride=2, bias=False),
-            nn.BatchNorm1d(channels[4]))
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with a x_avg, y_avg, t columns which is trajectory of the object.
 
-        self.layer3 = nn.Sequential(
-            ResidualBlock(channels[3], channels[4], stride=2, downsample=self.downsample2),
-            ResidualBlock(channels[4], channels[4]))
+        """
+        train_params = {'train_ind': train_ind,
+                        'n_epochs': n_epochs,
+                        'lr': lr,
+                        'batch_size': batch_size}
+        self.train_params = train_params
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        scheduler = StepLR(optimizer, step_size=1, gamma=0.9)
+        train_loader, valid_loader = get_loaders(train_ind, valid_ind, self.trend, self.window_size,
+                                                 self.step,
+                                                 self.train_correction, self.predict_correction,
+                                                 storage, self.frequency, batch_size)
 
-        self.downsample3 = nn.Sequential(
-            nn.Conv1d(channels[4], channels[5], kernel_size=1, stride=2, bias=False),
-            nn.BatchNorm1d(channels[5]))
+        train_loss, valid_loss = train(self.model, optimizer, train_loader, valid_loader,
+                                       criterion=criterion, device=self.device,
+                                       n_epochs=n_epochs, writer=None, verbose=verbose,
+                                       scheduler=scheduler)
+        if save_loss:
+            create_folder(f"{self.path}/{self.name}")
+            fig, ax = plt.subplots(1, 1)
+            ax.plot(train_loss)
+            ax.plot(valid_loss)
+            plt.close()
+            fig.savefig(f"{self.path}/{self.name}/loss.png")
+            pd.DataFrame([train_loss, valid_loss]).to_csv(
+                f"{self.path}/{self.name}/loss.csv")
 
-        self.layer4 = nn.Sequential(
-            ResidualBlock(channels[4], channels[5], stride=2, downsample=self.downsample3),
-            ResidualBlock(channels[5], channels[5]))
+    def predict(self, acc, gyro):
+        """Predicts trajectory of the object woth model and acc, gyro data.
 
-        self.avgpool = nn.AdaptiveAvgPool1d(output_size=1)
-        self.dropout = nn.Dropout(channels[6])
-        self.fc = nn.Linear(channels[5], 2)
+        Parameters
+        ----------
+        acc : pd.DataFrame
+            DataFrame of accelerometer readings.
+        gyro : pd.DataFrame
+            DataFrame of gyroscope readings.
 
-    def get_params(self):
-        params = {"init_params": self.init_params,
-                  "class_name": "ResNet"}
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with a x_avg, y_avg, t columns which is trajectory of the object.
 
-        return params
+        """
+        if self.model is None:
+            raise Exception('There is no model to use.')
+        x, t, q = process_data(acc, gyro, window_size=self.window_size,
+                               step=self.step, trend=self.trend,
+                               q_correction=self.predict_correction, frequency=self.frequency)
+        x = x.to(self.device)
+        self.model.eval()
+        with torch.no_grad():
+            v_pred = self.model(x).cpu().data.numpy()
 
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.bn(out)
-        out = self.relu(out)
-        out = self.maxpool(out)
+        v_pred = np.hstack([v_pred, np.zeros((v_pred.shape[0], 1))])
+        v_pred = apply_quats(v_pred, q) / (self.window_size / self.frequency)
+        trajectory_pred = get_traj_from_v_t(v_pred, t)
 
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
+        return trajectory_pred
 
-        out = self.avgpool(out)
-        out = out.view(out.size(0), -1)
-        out = self.dropout(out)
-        out = self.fc(out)
-        return out
+    def evaluate(self, names, storage, print_metrics=False, save=True,
+                 save_folder=None, save_path=None):
+        """Evaluate model, save predictions, figures and metrics
 
+        Parameters
+        ----------
+        names : list od strings
+            Names of the experiments in validation set.
+        storage : object of class Storage
+            Storage which contains the experiments.
+        print_metrics : bool
+            Whether to print mean scores of the model on each object.
+        save : bool
+            Whether to save figures and metrics.
+        save_folder : str, optional (default=None)
+            Name of the folder in model's folder to save evaluation results.
+        save_path : str, optional (default=None)
+            Full path to folder to save evaluation results.
 
-class LSTM(nn.Module):
-    def __init__(self, hyperparameters):
-        super(LSTM, self).__init__()
-        self.init_params = hyperparameters
-        self.input_dim = hyperparameters[0]
-        self.hidden_dim = hyperparameters[1]
-        self.num_layers = hyperparameters[2]
-        self.lstm = nn.LSTM(self.input_dim, self.hidden_dim, self.num_layers, batch_first=True)
+        Returns
+        -------
 
-        self.linear = nn.Linear(self.hidden_dim, 2)
-        self.dropout = nn.Dropout(hyperparameters[3])
+        """
+        metrics = []
+        if save_path is None:
+            if save_folder is None:
+                save_path = f"{self.path}/{self.name}/evaluate"
+            else:
+                save_path = f"{self.path}/{self.name}/{save_folder}"
+        path_fig = save_path + '/figures'
+        path_preds = save_path + '/trajectories'
+        if save:
+            create_folder(save_path)
+            create_folder(path_fig)
+            create_folder(path_preds)
 
-    def get_params(self):
-        params = {"init_params": self.init_params,
-                  "class_name": "LSTM"}
+        for name in tqdm(names):
+            acc, gyro = storage[name, 'acc'], storage[name, 'gyro']
+            trajectory = storage[name, 'trajectory']
+            prediction = self.predict(acc, gyro)
+            traj_fix, pred_fix = fix_trajectories(trajectory, prediction,
+                                                  coordinate_columns=('x_avg', 'y_avg'))
+            fig, met = show_trajectories(traj_fix, pred_fix, coordinate_columns=('x_avg', 'y_avg'),
+                                         show=False)
+            if save:
+                fig.savefig(path_fig + '/' + name + '.png')
+                prediction.to_csv(path_preds + '/' + name + '.csv')
+            metrics.append(met)
+        metrics = pd.DataFrame(metrics, index=names)
+        if save:
+            metrics.to_csv(save_path + '/' + 'metrics.csv')
+        if print_metrics:
+            print(metrics.mean())
 
-        return params
+    def save(self):
+        """Save params_dict and model to 'self.path/self.name'
 
-    def forward(self, x):
-        lstm_out, self.hidden = self.lstm(x.view(x.shape[0], x.shape[2], -1))
-        lstm_out = lstm_out.contiguous()[:, -1].view(x.shape[0], -1)
-        out = lstm_out.view(lstm_out.size(0), -1)
-        out = self.dropout(out)
-        y_pred = self.linear(out)
-        return y_pred
+        Returns
+        -------
 
+        """
+        path = f"{self.path}/{self.name}"
+        create_folder(path)
+        parameters = {key: value for key, value in self.__dict__.items() if
+                      not key.startswith('__') and not callable(key) and key != "model"}
+        model_params = self.model.get_params()
+        parameters["model_params"] = model_params
+        with open(path + '/parameters_dict.pkl', 'wb') as f:
+            pickle.dump(parameters, f)
+        torch.save(self.model.to(torch.device("cpu")).state_dict(), path + '/model')
+        self.model.to(self.device)
 
-class ResNetLSTM(nn.Module):
-    def __init__(self, channels):
-        super(ResNetLSTM, self).__init__()
-        self.init_params = channels
-        self.conv1 = nn.Conv1d(channels[0], channels[1], kernel_size=7,
-                               stride=2, padding=3, bias=True)
-        self.bn = nn.BatchNorm1d(channels[1])
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
-        self.layer1 = nn.Sequential(
-            ResidualBlock(channels[1], channels[2]),
-            ResidualBlock(channels[2], channels[2]))
+    def set_device(self, device="cpu"):
+        """Sets device.
 
-        self.downsample1 = nn.Sequential(
-            nn.Conv1d(channels[2], channels[3], kernel_size=1, stride=2, bias=False),
-            nn.BatchNorm1d(channels[3]))
+        Parameters
+        ----------
+        device : string, optional (default="cpu")
+            Device.
 
-        self.layer2 = nn.Sequential(
-            ResidualBlock(channels[2], channels[3], stride=2, downsample=self.downsample1),
-            ResidualBlock(channels[3], channels[3]))
+        Returns
+        -------
 
-        self.downsample2 = nn.Sequential(
-            nn.Conv1d(channels[3], channels[4], kernel_size=1, stride=2, bias=False),
-            nn.BatchNorm1d(channels[4]))
+        """
+        self.device = torch.device(device)
+        self.model.to(self.device)
 
-        self.layer3 = nn.Sequential(
-            ResidualBlock(channels[3], channels[4], stride=2, downsample=self.downsample2),
-            ResidualBlock(channels[4], channels[4]))
+    @staticmethod
+    def load(path, device="cpu"):
+        """Load TrajectoryEstimator from a directory path
 
-        self.input_dim = channels[4]
-        self.hidden_dim = channels[5]
-        self.num_layers = channels[6]
-        self.lstm = nn.LSTM(self.input_dim, self.hidden_dim, self.num_layers, batch_first=True)
-        self.linear = nn.Linear(self.hidden_dim, 2)
-        self.dropout = nn.Dropout(channels[7])
+        Parameters
+        ----------
+        path : string
+            Path to a folder where to create a new folder with parameters of estimator.
+        device : string, optional (default="cpu")
+            Device.
 
-    def get_params(self):
-        params = {"init_params": self.init_params,
-                  "class_name": "ResNetLSTM"}
+        Returns
+        -------
+        object of class TrajectoryEstimator
+            Estimator.
 
-        return params
+        """
+        with open(path + '/parameters_dict.pkl', 'rb') as f:
+            params = pickle.load(f)
+        params["device"] = device
+        if params["model_params"]["class_name"] == "LSTM":
+            model = LSTM(params["model_params"]["init_params"])
+        elif params["model_params"]["class_name"] == "ResNet":
+            model = ResNet(params["model_params"]["init_params"])
+        elif params["model_params"]["class_name"] == "ResNetLSTM":
+            model = ResNetLSTM(params["model_params"]["init_params"])
+        else:
+            raise ValueError("No class for such model.")
+        model.load_state_dict(torch.load(path + '/model', map_location=params["device"]))
+        estimator = TrajectoryEstimator(model=model, **params)
 
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.bn(out)
-        out = self.relu(out)
-        out = self.maxpool(out)
-
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        lstm_out, self.hidden = self.lstm(out.view(out.shape[0], out.shape[2], -1))
-        lstm_out = lstm_out.contiguous()[:, -1].view(out.shape[0], -1)
-        out = lstm_out.view(lstm_out.size(0), -1)
-        out = self.dropout(out)
-        out = self.linear(out)
-        return out
+        return estimator
