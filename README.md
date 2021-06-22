@@ -1,13 +1,6 @@
-***Requirements***
-
-Для обработки датасета  crossfit и получения результатов для дескрипторов:
-    1. Скачать данные: `https://drive.google.com/drive/folders/1BvjO8YxJjk5BPZAcEO42HuyJhja6XOOf`
-     (HAR_Crossfit_Sensors_Data/data/constrained_workout/preprocessed_numpy_data/np_exercise_data - путь до нужных данных)
-    2. Запустить скрипт crossfil_process.py: `python crossfil_process.py`
-    3. Запустить скрипт train_DE.py
+**Requirements**
     
-    
-    - _libgcc_mutex=0.1=main
+      -libgcc_mutex=0.1=main
       - _pytorch_select=0.2=gpu_0
       - abseil-cpp=20200225.2=he1b5a44_2
       - absl-py=0.11.0=py38h578d9bd_0
