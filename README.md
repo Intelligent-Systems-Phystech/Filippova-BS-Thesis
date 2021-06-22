@@ -1,4 +1,4 @@
-*Requirements*
+***Requirements***
 
 Для обработки датасета  crossfit и получения результатов для дескрипторов:
     1. Скачать данные: `https://drive.google.com/drive/folders/1BvjO8YxJjk5BPZAcEO42HuyJhja6XOOf`
